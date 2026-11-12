@@ -2,16 +2,17 @@ package cancel
 
 import (
 	"bytes"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"testing"
 
 	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/prompter"
 	"github.com/cli/cli/v2/pkg/cmd/run/shared"
+	workflowShared "github.com/cli/cli/v2/pkg/cmd/workflow/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/httpmock"
 	"github.com/cli/cli/v2/pkg/iostreams"
-	"github.com/cli/cli/v2/pkg/prompt"
 	"github.com/google/shlex"
 	"github.com/stretchr/testify/assert"
 )
@@ -40,18 +41,27 @@ func TestNewCmdCancel(t *testing.T) {
 			cli:  "1234",
 			wants: CancelOptions{
 				RunID: "1234",
+				Force: false,
+			},
+		},
+		{
+			name: "with arg and force flag",
+			cli:  "1234 --force",
+			wants: CancelOptions{
+				RunID: "1234",
+				Force: true,
 			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			io, _, _, _ := iostreams.Test()
-			io.SetStdinTTY(tt.tty)
-			io.SetStdoutTTY(tt.tty)
+			ios, _, _, _ := iostreams.Test()
+			ios.SetStdinTTY(tt.tty)
+			ios.SetStdoutTTY(tt.tty)
 
 			f := &cmdutil.Factory{
-				IOStreams: io,
+				IOStreams: ios,
 			}
 
 			argv, err := shlex.Split(tt.cli)
@@ -65,8 +75,8 @@ func TestNewCmdCancel(t *testing.T) {
 
 			cmd.SetArgs(argv)
 			cmd.SetIn(&bytes.Buffer{})
-			cmd.SetOut(ioutil.Discard)
-			cmd.SetErr(ioutil.Discard)
+			cmd.SetOut(io.Discard)
+			cmd.SetErr(io.Discard)
 
 			_, err = cmd.ExecuteC()
 			if tt.wantsErr {
@@ -77,21 +87,22 @@ func TestNewCmdCancel(t *testing.T) {
 			assert.NoError(t, err)
 
 			assert.Equal(t, tt.wants.RunID, gotOpts.RunID)
+			assert.Equal(t, tt.wants.Force, gotOpts.Force)
 		})
 	}
 }
 
 func TestRunCancel(t *testing.T) {
-	inProgressRun := shared.TestRun("more runs", 1234, shared.InProgress, "")
-	completedRun := shared.TestRun("more runs", 4567, shared.Completed, shared.Failure)
+	inProgressRun := shared.TestRun(1234, shared.InProgress, "")
+	completedRun := shared.TestRun(4567, shared.Completed, shared.Failure)
 	tests := []struct {
-		name      string
-		httpStubs func(*httpmock.Registry)
-		askStubs  func(*prompt.AskStubber)
-		opts      *CancelOptions
-		wantErr   bool
-		wantOut   string
-		errMsg    string
+		name        string
+		httpStubs   func(*httpmock.Registry)
+		promptStubs func(*prompter.MockPrompter)
+		opts        *CancelOptions
+		wantErr     bool
+		wantOut     string
+		errMsg      string
 	}{
 		{
 			name: "cancel run",
@@ -104,10 +115,13 @@ func TestRunCancel(t *testing.T) {
 					httpmock.REST("GET", "repos/OWNER/REPO/actions/runs/1234"),
 					httpmock.JSONResponse(inProgressRun))
 				reg.Register(
+					httpmock.REST("GET", "repos/OWNER/REPO/actions/workflows/123"),
+					httpmock.JSONResponse(shared.TestWorkflow))
+				reg.Register(
 					httpmock.REST("POST", "repos/OWNER/REPO/actions/runs/1234/cancel"),
 					httpmock.StatusStringResponse(202, "{}"))
 			},
-			wantOut: "✓ Request to cancel workflow submitted.\n",
+			wantOut: "✓ Request to cancel workflow 1234 submitted.\n",
 		},
 		{
 			name: "not found",
@@ -134,6 +148,9 @@ func TestRunCancel(t *testing.T) {
 					httpmock.REST("GET", "repos/OWNER/REPO/actions/runs/4567"),
 					httpmock.JSONResponse(completedRun))
 				reg.Register(
+					httpmock.REST("GET", "repos/OWNER/REPO/actions/workflows/123"),
+					httpmock.JSONResponse(shared.TestWorkflow))
+				reg.Register(
 					httpmock.REST("POST", "repos/OWNER/REPO/actions/runs/4567/cancel"),
 					httpmock.StatusStringResponse(409, ""),
 				)
@@ -154,6 +171,13 @@ func TestRunCancel(t *testing.T) {
 							completedRun,
 						},
 					}))
+				reg.Register(
+					httpmock.REST("GET", "repos/OWNER/REPO/actions/workflows"),
+					httpmock.JSONResponse(workflowShared.WorkflowsPayload{
+						Workflows: []workflowShared.Workflow{
+							shared.TestWorkflow,
+						},
+					}))
 			},
 		},
 		{
@@ -170,13 +194,75 @@ func TestRunCancel(t *testing.T) {
 						},
 					}))
 				reg.Register(
+					httpmock.REST("GET", "repos/OWNER/REPO/actions/workflows"),
+					httpmock.JSONResponse(workflowShared.WorkflowsPayload{
+						Workflows: []workflowShared.Workflow{
+							shared.TestWorkflow,
+						},
+					}))
+				reg.Register(
 					httpmock.REST("POST", "repos/OWNER/REPO/actions/runs/1234/cancel"),
 					httpmock.StatusStringResponse(202, "{}"))
 			},
-			askStubs: func(as *prompt.AskStubber) {
-				as.StubOne(0)
+			promptStubs: func(pm *prompter.MockPrompter) {
+				pm.RegisterSelect("Select a workflow run",
+					[]string{"* cool commit, CI [trunk] Feb 23, 2021"},
+					func(_, _ string, opts []string) (int, error) {
+						return prompter.IndexFor(opts, "* cool commit, CI [trunk] Feb 23, 2021")
+					})
 			},
-			wantOut: "✓ Request to cancel workflow submitted.\n",
+			wantOut: "✓ Request to cancel workflow 1234 submitted.\n",
+		},
+		{
+			name: "invalid run-id",
+			opts: &CancelOptions{
+				RunID: "12\n34",
+			},
+			httpStubs: func(reg *httpmock.Registry) {
+			},
+			wantErr: true,
+			errMsg:  "invalid run-id \"12\\n34\"",
+		},
+		{
+			name: "force cancel run",
+			opts: &CancelOptions{
+				RunID: "1234",
+				Force: true,
+			},
+			wantErr: false,
+			httpStubs: func(reg *httpmock.Registry) {
+				reg.Register(
+					httpmock.REST("GET", "repos/OWNER/REPO/actions/runs/1234"),
+					httpmock.JSONResponse(inProgressRun))
+				reg.Register(
+					httpmock.REST("GET", "repos/OWNER/REPO/actions/workflows/123"),
+					httpmock.JSONResponse(shared.TestWorkflow))
+				reg.Register(
+					httpmock.REST("POST", "repos/OWNER/REPO/actions/runs/1234/force-cancel"),
+					httpmock.StatusStringResponse(202, "{}"))
+			},
+			wantOut: "✓ Request to force cancel workflow 1234 submitted.\n",
+		},
+		{
+			name: "force and completed",
+			opts: &CancelOptions{
+				RunID: "4567",
+				Force: true,
+			},
+			wantErr: true,
+			errMsg:  "Cannot cancel a workflow run that is completed",
+			httpStubs: func(reg *httpmock.Registry) {
+				reg.Register(
+					httpmock.REST("GET", "repos/OWNER/REPO/actions/runs/4567"),
+					httpmock.JSONResponse(completedRun))
+				reg.Register(
+					httpmock.REST("GET", "repos/OWNER/REPO/actions/workflows/123"),
+					httpmock.JSONResponse(shared.TestWorkflow))
+				reg.Register(
+					httpmock.REST("POST", "repos/OWNER/REPO/actions/runs/4567/force-cancel"),
+					httpmock.StatusStringResponse(409, ""),
+				)
+			},
 		},
 	}
 
@@ -187,18 +273,18 @@ func TestRunCancel(t *testing.T) {
 			return &http.Client{Transport: reg}, nil
 		}
 
-		io, _, stdout, _ := iostreams.Test()
-		io.SetStdoutTTY(true)
-		io.SetStdinTTY(true)
-		tt.opts.IO = io
+		ios, _, stdout, _ := iostreams.Test()
+		ios.SetStdoutTTY(true)
+		ios.SetStdinTTY(true)
+		tt.opts.IO = ios
 		tt.opts.BaseRepo = func() (ghrepo.Interface, error) {
 			return ghrepo.FromFullName("OWNER/REPO")
 		}
 
-		as, teardown := prompt.InitAskStubber()
-		defer teardown()
-		if tt.askStubs != nil {
-			tt.askStubs(as)
+		pm := prompter.NewMockPrompter(t)
+		tt.opts.Prompter = pm
+		if tt.promptStubs != nil {
+			tt.promptStubs(pm)
 		}
 
 		t.Run(tt.name, func(t *testing.T) {
